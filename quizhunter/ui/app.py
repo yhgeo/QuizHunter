@@ -420,24 +420,27 @@ class App:
 
         # ---- 匹配题库卡片：命中显示原题，未命中显示最接近的候选 ----
         match = result.match
+        warn = ""
+        if result.polarity_conflict or (match is not None and match.polarity_conflict):
+            warn = "⚠ 检测到「是/不是」等相反题意的高相似题，请核对下方候选！\n"
         if match is not None and match.hit and match.entry is not None:
             entry = match.entry
             question = getattr(entry, "question", "") or ""
             answer = getattr(entry, "answer", "") or ""
             aliases = getattr(entry, "aliases", []) or []
-            text = f"题　目：{question}\n答　案：{answer}"
+            text = warn + f"题　目：{question}\n答　案：{answer}"
             if aliases:
                 text += f"\n别　名：{', '.join(str(a) for a in aliases)}"
             self.match_var.set(text)
-            self.match_lbl.configure(foreground=theme.FG)
+            self.match_lbl.configure(foreground=theme.WARN if warn else theme.FG)
         elif result.candidates:
             lines = [f"{i}. [{c.score:.2f}] {c.answer} · {c.question[:60]}"
                      for i, c in enumerate(result.candidates, 1)]
-            self.match_var.set("未命中 · 最接近的题库题目：\n" + "\n".join(lines))
-            self.match_lbl.configure(foreground=theme.MUTED)
+            self.match_var.set(warn + "未命中 · 最接近的题库题目：\n" + "\n".join(lines))
+            self.match_lbl.configure(foreground=theme.WARN if warn else theme.MUTED)
         else:
-            self.match_var.set("—" if not result.ok else "（AI 作答，无匹配题库条目）")
-            self.match_lbl.configure(foreground=theme.MUTED)
+            self.match_var.set(warn or ("—" if not result.ok else "（AI 作答，无匹配题库条目）"))
+            self.match_lbl.configure(foreground=theme.WARN if warn else theme.MUTED)
 
         w.set_readonly(self.ocr_text, False)
         self.ocr_text.delete("1.0", "end")

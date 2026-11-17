@@ -1,21 +1,20 @@
-"""题库匹配：文本规范化 + 四段式模糊匹配 + LRU 缓存。
+"""题库匹配：文本规范化 + 全量打分择优 + 极性判别 + LRU 缓存。
 
-四段式（优先级从高到低）：
+相比旧版「四段式短路」的关键修复：
+* 旧版 exact/contains 一旦命中就立即 return，导致题库中排在前面的「相似题」
+  抢先返回，后面真正更贴切的题目被完全跳过——这就是「意思差不多但答案不同」
+  的题会答错、更优匹配被漏掉的根因。
+* 新版对所有候选统一打分，取全局最高分；并用「极性词」区分
+  「是/不是」「正确/错误」「属于/不属于」这类一字之差、答案相反的题。
 
-==========  ================================================  ==========================
-模式        判定                                               说明
-==========  ================================================  ==========================
-exact       规范化后完全相等                                    直接短路
-contains    一方完整包含另一方，且短串长度 >= min_contains      取最长候选，避免短题错配
-substring   较短串被匹配块覆盖比例 >= substring_threshold       容忍 OCR 漏字/多字
-similarity  编辑相似度 >= similarity_threshold                  最后兜底
-==========  ================================================  ==========================
+评分构成（0~1）：
+  base   = max(编辑相似度, 子串覆盖率×0.98, 包含匹配分)
+  polarity_penalty：题干极性相反（肯定是↔否定是）时 ×0.35
+  最终取 score 最大者；mode 标记来源，score 不再人为钉死 1.0。
 
-两个关键点：
-* SequenceMatcher 一律 autojunk=False。默认 autojunk=True 在序列长度 >200 时把高频
-  字符（中文题干里的「的」「是」）当噪声丢弃，长题相似度被系统性低估。
-* 子串覆盖率用一次 get_matching_blocks() 求「较短串被覆盖比例」，复杂度 O(n·m)，
-  不是逐滑动窗口调 ratio() 的 O(n²·m)。
+两个性能关键点：
+* SequenceMatcher 一律 autojunk=False，避免长中文题干高频字被当噪声；
+* 子串覆盖率用一次 get_matching_blocks() 求覆盖比例，复杂度 O(n·m)。
 """
 
 from __future__ import annotations
@@ -31,6 +30,14 @@ _MARKER_RE = re.compile(r"【\s*答\s*案\s*】|\[\s*答\s*案\s*\]|（\s*答\s*
 _OPTION_LINE_RE = re.compile(
     r"^[\s\u3000]*(?:[（(]\s*[A-Da-dＡ-Ｄａ-ｄ]\s*[）)]|[A-Da-dＡ-Ｄａ-ｄ]\s*[\.、．\)）:：])")
 
+# 极性词：题干首行出现这些词，代表题目问的是肯定还是否定方向。
+# 一字之差答案相反的题（「下列正确的」↔「下列不正确的」）靠这个区分。
+_NEG_WORDS = ("不是", "不属于", "不正确", "不对", "错误", "除外", "不包括",
+              "不包含", "不具备", "不能", "不应", "不宜", "无关", "不可以",
+              "错误的是", "不正确的", "除了", "不能是", "不会")
+_POS_WORDS = ("正确", "属于", "是", "包括", "包含", "具有", "能够", "应该",
+              "可以", "有关", "正确的是", "属于的是")
+
 
 @dataclass(frozen=True)
 class Candidate:
@@ -38,6 +45,7 @@ class Candidate:
     normalized: str
     char_set: FrozenSet[str]
     kind: str = "question"
+    stem: str = ""            # 题干首行（去选项），用于极性比对
 
 
 @dataclass
@@ -57,6 +65,7 @@ class MatchResult:
     query_length: int = 0
     elapsed: float = 0.0
     top: List[TopCandidate] = field(default_factory=list)
+    polarity_conflict: bool = False   # 是否出现极性相反的高相似题（提示人工核对）
 
     @property
     def hit(self) -> bool:
@@ -95,6 +104,28 @@ def strip_options(text: str) -> str:
     return "\n".join(kept).strip()
 
 
+def first_stem(text: str) -> str:
+    """题干第一行（去题型前缀与空白），极性判别的依据。"""
+    stem = strip_options(text).splitlines()
+    return stem[0].strip() if stem else ""
+
+
+def polarity(text: str) -> int:
+    """返回题干极性：-1 否定 / 1 肯定 / 0 中性。
+
+    只在题干文本上调用（不含选项），避免判断题选项「A正确 B错误」干扰。
+    否定词优先匹配，避免「不是」里的「是」被当成肯定。
+    """
+    s = normalize(text)
+    if not s:
+        return 0
+    if any(w in s for w in _NEG_WORDS):
+        return -1
+    if any(w in s for w in _POS_WORDS):
+        return 1
+    return 0
+
+
 def build_candidates(question: str, aliases: Sequence[str] = ()) -> List[Candidate]:
     """构建去重后的候选列表（题干 / 去选项题干 / 别名）。"""
     seen: set = set()
@@ -112,7 +143,8 @@ def build_candidates(question: str, aliases: Sequence[str] = ()) -> List[Candida
             continue
         seen.add(norm)
         result.append(Candidate(text=str(text).strip(), normalized=norm,
-                                char_set=frozenset(norm), kind=kind))
+                                char_set=frozenset(norm), kind=kind,
+                                stem=first_stem(text)))
     return result
 
 
@@ -148,20 +180,22 @@ def char_overlap(left: FrozenSet[str], right: FrozenSet[str]) -> float:
 
 # ---------------------------------------------------------------- 匹配器
 class BankMatcher:
-    """有缓存的题库匹配器。条目/阈值变更后调用 invalidate()。"""
+    """全量打分的题库匹配器。条目/阈值变更后调用 invalidate()。"""
 
     def __init__(self, entries: Optional[Sequence[Any]] = None,
                  similarity_threshold: float = 0.72,
                  substring_threshold: float = 0.80,
                  min_query_length: int = 8,
                  min_contains_length: int = 8,
-                 cache_size: int = 256):
+                 cache_size: int = 256,
+                 polarity_penalty: float = 0.35):
         self.entries: List[Any] = list(entries or [])
         self.similarity_threshold = float(similarity_threshold)
         self.substring_threshold = float(substring_threshold)
         self.min_query_length = max(1, int(min_query_length))
         self.min_contains_length = max(1, int(min_contains_length))
         self.cache_size = max(0, int(cache_size))
+        self.polarity_penalty = float(polarity_penalty)
         self._cache: Dict[str, MatchResult] = {}
         self._order: List[str] = []
 
@@ -190,84 +224,114 @@ class BankMatcher:
             cached = self._cache[query]
             return MatchResult(**{**cached.__dict__, "elapsed": time.time() - started})
         if len(query) < self.min_query_length:
-            # 过短文本禁止走包含/相似度，否则「下列说法正确的是」秒中一切
             result = MatchResult(mode="skipped", query_length=len(query),
                                  elapsed=time.time() - started)
             self._remember(query, result)
             return result
-        result = self._match_uncached(query)
+        result = self._match_uncached(query, first_stem(question_text))
         result.elapsed = time.time() - started
         self._remember(query, result)
         return result
 
-    def _match_uncached(self, query: str) -> MatchResult:
+    def _score_candidate(self, query: str, q_set: FrozenSet[str], q_len: int,
+                         q_pol: int, norm: str, c_set: FrozenSet[str],
+                         c_stem: str) -> Tuple[float, str, bool]:
+        """返回 (score, mode, polarity_conflict)。"""
+        # 完全一致：满分
+        if norm == query:
+            return 1.0, "exact", False
+        # 字符集预筛：几乎不相交，后续计算没意义
+        if char_overlap(q_set, c_set) < 0.34:
+            return 0.0, "", False
+
+        shorter = min(q_len, len(norm))
+        length_ratio = shorter / max(q_len, len(norm))
+        best_score = 0.0
+        best_mode = ""
+
+        # 编辑相似度
+        if length_ratio >= 0.5:
+            r = similarity(query, norm)
+            if r > best_score:
+                best_score, best_mode = r, "similarity"
+        # 子串覆盖（略打折，容忍 OCR 漏字但不让它压过编辑相似）
+        if length_ratio >= 0.2:
+            c = containment_score(query, norm) * 0.98
+            if c > best_score:
+                best_score, best_mode = c, "substring"
+        # 包含关系：不再钉死 1.0，按长度比给分，防止长题干包含短题就锁死
+        if shorter >= self.min_contains_length and (norm in query or query in norm):
+            cv = 0.97 if length_ratio >= 0.9 else (0.72 + 0.25 * length_ratio)
+            if cv > best_score:
+                best_score, best_mode = cv, "contains"
+
+        # 极性判别：题干肯定↔否定相反则大幅降分，并标记为冲突
+        conflict = False
+        c_pol = polarity(c_stem)
+        if q_pol and c_pol and q_pol != c_pol:
+            best_score *= self.polarity_penalty
+            conflict = True
+        return best_score, best_mode, conflict
+
+    def _match_uncached(self, query: str, query_stem: str) -> MatchResult:
         q_set = frozenset(query)
         q_len = len(query)
-        best_contains = None
-        best_contains_len = -1
-        best_sim = None
-        best_sim_score = 0.0
-        best_sim_text = ""
-        best_sub = None
-        best_sub_score = 0.0
-        best_sub_text = ""
+        q_pol = polarity(query_stem)
+
+        best_entry = None
+        best_score = 0.0
+        best_mode = ""
+        best_candidate_text = ""
+        best_conflict = False
         tops: List[TopCandidate] = []
+        high_conflicts: List[TopCandidate] = []
 
         for entry in self.entries:
+            entry_best = 0.0
+            entry_mode = ""
+            entry_text = ""
+            entry_conflict = False
             for candidate in getattr(entry, "candidates", ()):
-                norm = candidate.normalized
-                if not norm:
+                if not candidate.normalized:
                     continue
-                # 完全一致：短路
-                if norm == query:
-                    return MatchResult(
-                        entry=entry, mode="exact", score=1.0, candidate=candidate.text,
-                        query_length=q_len,
-                        top=self._collect_top(tops, entry, 1.0, "exact"))
-                # 字符集预筛：几乎不相交，后续计算没意义
-                if char_overlap(q_set, candidate.char_set) < 0.34:
-                    continue
-                shorter = min(q_len, len(norm))
-                # 包含匹配：短串设长度门槛，防止「体育」命中「体育理论测试」
-                if shorter >= self.min_contains_length and (norm in query or query in norm):
-                    if len(norm) > best_contains_len:
-                        best_contains, best_contains_len = entry, len(norm)
-                    tops.append(TopCandidate(getattr(entry, "question", ""),
-                                             getattr(entry, "answer", ""), 1.0, "contains"))
-                    continue
-                ratio_value = 0.0
-                length_ratio = shorter / max(q_len, len(norm))
-                if length_ratio >= 0.5:
-                    ratio_value = similarity(query, norm)
-                    if ratio_value > best_sim_score:
-                        best_sim, best_sim_score, best_sim_text = entry, ratio_value, candidate.text
-                sub_value = 0.0
-                if length_ratio >= 0.2:
-                    sub_value = containment_score(query, norm)
-                    if sub_value > best_sub_score:
-                        best_sub, best_sub_score, best_sub_text = entry, sub_value, candidate.text
-                local_best = max(ratio_value, sub_value)
-                if local_best > 0.5:
-                    tops.append(TopCandidate(getattr(entry, "question", ""),
-                                             getattr(entry, "answer", ""),
-                                             round(local_best, 4), "candidate"))
+                score, mode, conflict = self._score_candidate(
+                    query, q_set, q_len, q_pol,
+                    candidate.normalized, candidate.char_set, candidate.stem)
+                if score > entry_best:
+                    entry_best, entry_mode, entry_text, entry_conflict = (
+                        score, mode, candidate.text, conflict)
+            # 每条题取自身最优候选，避免同题多候选重复进 top
+            if entry_best > 0.5:
+                q_text = getattr(entry, "question", "")
+                a_text = getattr(entry, "answer", "")
+                tops.append(TopCandidate(q_text, a_text, round(entry_best, 4), entry_mode))
+                if entry_conflict and entry_best >= self.similarity_threshold:
+                    high_conflicts.append(TopCandidate(q_text, a_text,
+                                                       round(entry_best, 4), entry_mode))
+            if entry_best > best_score:
+                best_score, best_entry = entry_best, entry
+                best_mode, best_candidate_text, best_conflict = (
+                    entry_mode, entry_text, entry_conflict)
 
         top3 = self._collect_top(tops, None, 0, "")
-        if best_contains is not None:
-            return MatchResult(entry=best_contains, mode="contains", score=1.0,
-                               candidate=getattr(best_contains, "question", ""),
-                               query_length=q_len, top=top3)
-        if best_sub is not None and best_sub_score >= self.substring_threshold:
-            return MatchResult(entry=best_sub, mode="substring", score=best_sub_score,
-                               candidate=best_sub_text, query_length=q_len, top=top3)
-        if best_sim is not None and best_sim_score >= self.similarity_threshold:
-            return MatchResult(entry=best_sim, mode="similarity", score=best_sim_score,
-                               candidate=best_sim_text, query_length=q_len, top=top3)
-        score = max(best_sim_score, best_sub_score)
-        candidate_text = best_sub_text if best_sub_score >= best_sim_score else best_sim_text
-        return MatchResult(entry=None, mode="miss", score=score,
-                           candidate=candidate_text or (top3[0].question if top3 else ""),
-                           query_length=q_len, top=top3)
+        conflict_flag = best_conflict or bool(high_conflicts)
+
+        if best_entry is not None and best_score >= self.similarity_threshold:
+            # 极性冲突下命中不可靠：降级为 miss，把两个候选都列出来让人核对
+            if best_conflict:
+                merged = self._collect_top(
+                    high_conflicts + tops, best_entry, best_score, best_mode, limit=5)
+                return MatchResult(entry=None, mode="miss", score=best_score,
+                                   candidate=best_candidate_text, query_length=q_len,
+                                   top=merged, polarity_conflict=True)
+            mode = "exact" if best_score >= 1.0 else best_mode
+            return MatchResult(entry=best_entry, mode=mode, score=round(best_score, 4),
+                               candidate=best_candidate_text, query_length=q_len,
+                               top=top3, polarity_conflict=conflict_flag)
+
+        return MatchResult(entry=None, mode="miss", score=round(best_score, 4),
+                           candidate=best_candidate_text or (top3[0].question if top3 else ""),
+                           query_length=q_len, top=top3, polarity_conflict=conflict_flag)
 
     @staticmethod
     def _collect_top(existing: List[TopCandidate], entry: Optional[Any],

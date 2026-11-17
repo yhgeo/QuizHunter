@@ -38,6 +38,7 @@ class SolveResult:
     timings: Dict[str, float] = field(default_factory=dict)
     image_size: Tuple[int, int] = (0, 0)
     match: Optional[MatchResult] = None
+    polarity_conflict: bool = False   # 题干极性相反的高相似题，提示人工核对
 
     @property
     def total(self) -> float:
@@ -165,6 +166,7 @@ class Solver:
                     result.mode = match.mode
                     result.score = round(match.score, 4)
                     result.candidates = match.top
+                    result.polarity_conflict = match.polarity_conflict
                     if match.hit:
                         result.ok = True
                         result.answer = match.answer
