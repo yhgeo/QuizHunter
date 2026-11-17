@@ -105,9 +105,19 @@ def strip_options(text: str) -> str:
 
 
 def first_stem(text: str) -> str:
-    """题干第一行（去题型前缀与空白），极性判别的依据。"""
-    stem = strip_options(text).splitlines()
-    return stem[0].strip() if stem else ""
+    """题干首行，极性判别的依据。
+
+    OCR 文本常把「多选题 / 单选题 / 判断题」题型标签单独放一行，
+    真正题干在下一行。必须跳过标签行，否则极性判别取到标签（极性中性），
+    导致「属于↔不属于」这类只差一个字的反义题无法区分。
+    """
+    lines = [l.strip() for l in strip_options(text).splitlines() if l.strip()]
+    for line in lines:
+        # 纯题型标签行（可能带序号/冒号）：多选题、单选题、判断题、不定项选择题
+        if re.fullmatch(r"[\(（]?\s*(多|单|不?定项|判断)项?选?择?题\s*[\)）:：]?", line):
+            continue
+        return line
+    return lines[0] if lines else ""
 
 
 def polarity(text: str) -> int:

@@ -56,7 +56,9 @@ def parse_docx(path: Path, qtype: str):
         stem = TYPE_PREFIX_RE.sub("", stem).strip()
         stem = re.sub(r"\s+", " ", stem)
         if stem and options and answer:
-            parts = [stem]
+            # 题型词拼进题干：OCR 常把「单选题/多选题/判断题」一起识别出来，
+            # 保留它可让题型成为额外的判别维度（单选/多选题干相同时尤其关键）。
+            parts = [f"{qtype}题 {stem}"]
             for k in sorted(options):
                 parts.append(f"{k}. {options[k]}")
             entries.append({"question": "\n".join(parts), "answer": answer,

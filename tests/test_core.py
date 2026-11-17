@@ -92,6 +92,24 @@ class MatcherTest(unittest.TestCase):
         self.assertEqual(matcher.match(q1).answer, "B")
         self.assertEqual(matcher.match(q2).answer, "ACD")
 
+    def test_type_label_skipped_and_same_options(self):
+        """回归：OCR 首行是题型标签、选项完全相同、题干只差「不」字。
+
+        截图实测：OCR 识别「多选题 + 下列属于肌耐力…」，题库里
+        「单选 下列不属于肌耐力」与「多选 下列属于肌耐力」选项完全一致，
+        必须靠题型词 + 极性（跳过题型标签行取到真题干）区分，答 ACD 而非 B/D。
+        """
+        entries = [
+            BankEntry("单选题 下列不属于肌耐力的检测方法是\nA. 一分钟屈膝仰卧起坐\nB. 30秒屈膝仰卧起坐\nC. 仰卧举腿\nD. 修正式背后推撑", "B"),
+            BankEntry("单选题 下列属于肌耐力的检测方法是\nA. 30秒屈膝仰卧起坐\nB. 立定跳远\nC. 手握力测验\nD. 俯卧撑测验", "D"),
+            BankEntry("多选题 下列属于肌耐力的检测方法是\nA. 一分钟屈膝仰卧起坐\nB. 30秒屈膝仰卧起坐\nC. 仰卧举腿\nD. 修正式背后推撑", "ACD"),
+        ]
+        m = BankMatcher(entries, 0.72, 0.80, 8, 8)
+        ocr = ("多选题\n下列属于肌耐力的检测方法是\n一分钟屈膝仰卧起坐\n"
+               "30秒屈膝仰卧起坐\n仰卧举腿\n修正式背后推撑")
+        self.assertEqual(polarity(first_stem(ocr)), 1)  # 跳过「多选题」标签行
+        self.assertEqual(m.match(ocr).answer, "ACD")
+
     def test_polarity_conflict_flagged(self):
         """题干肯定但选项含否定题特征、且两题高度相似时，标记冲突供核对。"""
         entries = [
